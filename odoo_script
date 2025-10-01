@@ -11,7 +11,7 @@ function pullLeadsToSheet() {
   try {
     const apiKey = PropertiesService.getScriptProperties().getProperty('ODOO_API_KEY');
     const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
-    if (!sheet) throw new Error(`Лист "${SHEET_NAME}" не найден`);
+    if (!sheet) throw new Error(`List "${SHEET_NAME}" not found`);
 
     sheet.clear();
 
