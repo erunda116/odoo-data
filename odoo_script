@@ -1,0 +1,232 @@
+// === Settings ===
+const ODOO_URL = 'https://euromuro.odoo.com';  // add your Odoo domain
+const ODOO_DB = 'euromuro';                   // Add your data base name
+const ODOO_USER_ID = 2;                           // Odoo user ID
+const SHEET_NAME = 'Leads';
+
+/**
+ * Main function: get Odoo leads and add it into spreadsheet
+ */
+function pullLeadsToSheet() {
+  try {
+    const apiKey = PropertiesService.getScriptProperties().getProperty('ODOO_API_KEY');
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+    if (!sheet) throw new Error(`Лист "${SHEET_NAME}" не найден`);
+
+    sheet.clear();
+
+    // headers
+    const headers = [
+      'Opportunity', 'Contact name', 'Email', 'Salesperson', 'Expected revenue',
+      'Stage', 'Source', 'Referred by', 'City', 'Created on'
+    ];
+    sheet.appendRow(headers);
+
+    // Stage and source filter
+    const stageNames = ['Estimation', 'Proposition Sent', 'Deposit', 'Production', 'Delivery', 'Won'];
+    const sourceName = 'Facebook';
+
+    const stageIds = findStageIdsByNames_(stageNames, apiKey);
+    const sourceId = findSourceIdByName_(sourceName, apiKey);
+
+    if (!stageIds.length) throw new Error('Не найдены стадии: ' + stageNames.join(', '));
+    if (!sourceId) throw new Error('Не найден источник: ' + sourceName);
+
+    // Last 30 days
+    const thirtyDaysAgo = new Date();
+thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 31);
+    //const now = new Date();
+    //const thirtyDaysAgo = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 30);
+    const thirtyDaysAgoStr = Utilities.formatDate(thirtyDaysAgo, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+
+    
+    // Domain
+    const domain = [
+  ['source_id', '=', sourceId],
+  ['create_date', '>=', thirtyDaysAgoStr],
+  '|', '|', '|', '|', '|',
+  ['stage_id.name', 'ilike', 'Estimation'],
+  ['stage_id.name', 'ilike', 'Proposition'],
+  ['stage_id.name', 'ilike', 'Deposit'],
+  ['stage_id.name', 'ilike', 'Production'],
+  ['stage_id.name', 'ilike', 'Delivery'],
+  ['stage_id.name', 'ilike', 'Won']
+];
+
+
+
+    const fields = [
+      'name', 'contact_name', 'email_from', 'user_id', 'expected_revenue',
+      'stage_id', 'source_id', 'referred', 'city', 'create_date'
+    ];
+
+    const leads = callOdoo_('crm.lead', 'search_read', [domain], { fields }, apiKey);
+
+    leads.forEach(lead => {
+      sheet.appendRow([
+        lead.name || '',
+        lead.contact_name || '',
+        lead.email_from || '',
+        lead.user_id ? lead.user_id[1] : '',
+        lead.expected_revenue || '',
+        lead.stage_id ? lead.stage_id[1] : '',
+        lead.source_id ? lead.source_id[1] : '',
+        lead.referred || '',
+        lead.city || '',
+        lead.create_date ? lead.create_date.split(' ')[0] : ''
+      ]);
+    });
+
+    Logger.log(`Sucessfully exported ${leads.length} лидов.`);
+
+    // Update data from Meta Ads
+    updateMetaData_();
+
+  } catch (err) {
+    Logger.log('Error pullLeadsToSheet: ' + err);
+  }
+}
+
+/**
+ * Get stage ID by name
+ */
+function findStageIdsByNames_(names, apiKey) {
+  const domain = [['name', 'in', names]];
+  const fields = ['name'];
+  const result = callOdoo_('crm.stage', 'search_read', [domain], { fields }, apiKey);
+  return result.map(r => r.id);
+}
+
+/**
+ * Get source ID by name
+ */
+function findSourceIdByName_(name, apiKey) {
+  const domain = [['name', '=', name]];
+  const fields = ['name'];
+  const result = callOdoo_('utm.source', 'search_read', [domain], { fields }, apiKey);
+  return result.length ? result[0].id : null;
+}
+
+/**
+ * Call Odoo JSON-RPC 2.0 API
+ */
+function callOdoo_(model, method, args = [], kwargs = {}, apiKey) {
+  const url = `${ODOO_URL}/jsonrpc`;
+  const payload = {
+    jsonrpc: "2.0",
+    method: "call",
+    params: {
+      service: "object",
+      method: "execute_kw",
+      args: [
+        ODOO_DB,
+        ODOO_USER_ID,
+        apiKey,
+        model,
+        method,
+        args,
+        kwargs
+      ]
+    },
+    id: Math.floor(Math.random() * 100000)
+  };
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  const response = UrlFetchApp.fetch(url, options);
+  const data = JSON.parse(response.getContentText());
+
+  if (data.error) throw new Error('Odoo error: ' + JSON.stringify(data.error));
+  return data.result || [];
+}
+
+/**
+ * Get data from Meta Ads: Ad Name, Spend, ROAS (%)
+ */
+function updateMetaData_() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  const token = PropertiesService.getScriptProperties().getProperty('META_ACCESS_TOKEN');
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return; // нет данных
+
+  const adIdCol = 8; // Referred by
+  const expectedRevenueCol = 5; // Expected revenue из Odoo
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+  let adNameCol = headers.indexOf('Ad Name') + 1;
+  let spendCol = headers.indexOf('Spend') + 1;
+  let roasCol = headers.indexOf('ROAS') + 1;
+
+  if (!adNameCol) { adNameCol = sheet.getLastColumn() + 1; sheet.getRange(1, adNameCol).setValue('Ad Name'); }
+  if (!spendCol)   { spendCol   = sheet.getLastColumn() + 1; sheet.getRange(1, spendCol).setValue('Spend'); }
+  if (!roasCol)    { roasCol    = sheet.getLastColumn() + 1; sheet.getRange(1, roasCol).setValue('ROAS (%)'); }
+
+  const adIds = sheet.getRange(2, adIdCol, lastRow - 1, 1).getValues();
+  const expectedRevenueData = sheet.getRange(2, expectedRevenueCol, lastRow - 1, 1).getValues();
+
+  // Last 30 days
+  const endDate = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  const startDateObj = new Date(); startDateObj.setDate(startDateObj.getDate() - 30);
+  const startDate = Utilities.formatDate(startDateObj, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+
+  adIds.forEach((row, i) => {
+    const adId = String(row[0] || '').trim();
+    if (!adId || isNaN(adId)) return;
+
+    try {
+      // 1) Ad Name
+      const adInfoUrl = `https://graph.facebook.com/v19.0/${adId}?fields=name&access_token=${token}`;
+      const adInfoResp = UrlFetchApp.fetch(adInfoUrl, { muteHttpExceptions: true });
+      const adInfoJson = JSON.parse(adInfoResp.getContentText());
+      const adName = adInfoJson.name || '';
+
+      // 2) Insights: only spend
+      const timeRange = encodeURIComponent(JSON.stringify({ since: startDate, until: endDate }));
+      const insightsUrl = `https://graph.facebook.com/v19.0/${adId}/insights?fields=spend&time_range=${timeRange}&level=ad&access_token=${token}`;
+      const insightsResp = UrlFetchApp.fetch(insightsUrl, { muteHttpExceptions: true });
+      const insightsJson = JSON.parse(insightsResp.getContentText());
+      const insight = insightsJson.data && insightsJson.data[0] ? insightsJson.data[0] : {};
+
+      const spend = parseFloat(insight.spend || 0);
+
+      // ROAS (%) = (Expected Revenue / Spend) * 100
+      const expectedRevenue = parseFloat(expectedRevenueData[i][0] || 0);
+      const roas = spend > 0 ? ((expectedRevenue / spend) * 100).toFixed(2) : 0;
+
+      // Записываем в Google Sheet
+      sheet.getRange(i + 2, adNameCol).setValue(adName);
+      sheet.getRange(i + 2, spendCol).setValue(spend);
+      sheet.getRange(i + 2, roasCol).setValue(roas);
+
+      Utilities.sleep(500); // to not get API limits
+    } catch (err) {
+      Logger.log(`Ошибка Meta Ads для ID ${adId}: ${err}`);
+    }
+  });
+}
+
+/**
+ * Triger creation
+ */
+function createDailyTrigger() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'pullLeadsToSheet') {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  ScriptApp.newTrigger('pullLeadsToSheet')
+    .timeBased()
+    .everyDays(1)
+    .atHour(6)
+    .create();
+
+  Logger.log('✅ Daily trigger for 6:00');
+}
